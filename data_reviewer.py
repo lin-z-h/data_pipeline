@@ -24,7 +24,7 @@ def setup_trash(trash_dir):
         os.makedirs(trash_dir)
 
 
-def draw_overlay(img, filename, current_idx, total, is_marked):
+def draw_overlay(img, filename, current_idx, total, is_marked, goto_buffer=""):
     """在图片上绘制UI信息（已修复字体过大超框的问题）"""
     # 1. 提取标签
     try:
@@ -59,14 +59,17 @@ def draw_overlay(img, filename, current_idx, total, is_marked):
         cv2.putText(img, f"Cmd: {command}", (w//2 - 80, h//2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
 
-    # 3. 绘制左上角的进度条
-    # 修改：字号降为 0.6，紧贴左上角
-    cv2.putText(img, f"[{current_idx + 1} / {total}]", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    # 3. 绘制左上角的进度条（含跳转输入）
+    # 修改：字号降为 0.55，进度与跳转同行紧凑显示
+    progress_text = f"[{current_idx + 1} / {total}]"
+    if goto_buffer:
+        progress_text += f"  Goto: {goto_buffer}_"
+    cv2.putText(img, progress_text, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
     # 4. 绘制底部的操作提示
     # 修改：精简了文案，缩短长度；字号降为 0.45，紧贴底部边缘，绝对不会超框
-    controls = "[Space/D]:Next | [A]:Prev | [X]:Trash | [Q]:Quit"
+    controls = "Space/D:Next  A:Prev  X:Trash  Num+Enter:Jump  Q:Quit"
     cv2.putText(img, controls, (10, h - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (230, 230, 230), 1)
 
@@ -100,6 +103,7 @@ def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
     marked_for_deletion = set()
 
     idx = 0
+    goto_buffer = ""  # 跳转数字输入缓冲区
     # 创建一个命名窗口，允许自由缩放大小
     cv2.namedWindow('Data Reviewer', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Data Reviewer', 800, 600)  # 默认弹窗大小
@@ -118,22 +122,40 @@ def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
         is_marked = img_path in marked_for_deletion
 
         # 绘制 UI 界面
-        display_img = draw_overlay(img, filename, idx, total_images, is_marked)
+        display_img = draw_overlay(img, filename, idx, total_images, is_marked, goto_buffer)
         cv2.imshow('Data Reviewer', display_img)
 
         # 等待键盘输入 (0 表示无限等待，直到有按键按下)
         key = cv2.waitKey(0) & 0xFF
 
-        # 按下 D 或 空格键：认为图片没问题，播放下一张
-        if key == ord(' ') or key == ord('d'):
+        # ---- 数字键入：累积到跳转缓冲区 ----
+        if ord('0') <= key <= ord('9'):
+            goto_buffer += chr(key)
+
+        # ---- 回车：执行跳转 ----
+        elif key == 13:  # Enter
+            if goto_buffer:
+                target = int(goto_buffer)
+                idx = max(0, min(target - 1, total_images - 1))
+            goto_buffer = ""
+
+        # ---- 退格：删除最后一位 ----
+        elif key == 8:  # Backspace
+            goto_buffer = goto_buffer[:-1]
+
+        # ---- 按下 D 或 空格键：认为图片没问题，播放下一张 ----
+        elif key == ord(' ') or key == ord('d'):
+            goto_buffer = ""
             idx += 1
 
-        # 按下 A 键：手滑了，返回上一张图片重新看
+        # ---- 按下 A 键：手滑了，返回上一张图片重新看 ----
         elif key == ord('a'):
+            goto_buffer = ""
             idx = max(0, idx - 1)
 
-        # 按下 X 键：标记或取消标记垃圾
+        # ---- 按下 X 键：标记或取消标记垃圾 ----
         elif key == ord('x'):
+            goto_buffer = ""
             if is_marked:
                 # 如果已经标记了，再次按 X 则是"撤销标记"，并停留在当前页让你确认
                 marked_for_deletion.remove(img_path)
@@ -142,7 +164,7 @@ def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
                 marked_for_deletion.add(img_path)
                 idx += 1
 
-        # 按下 Q 或 ESC 键：退出审查并执行清理
+        # ---- 按下 Q 或 ESC 键：退出审查并执行清理 ----
         elif key == ord('q') or key == 27:
             break
 

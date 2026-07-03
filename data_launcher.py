@@ -80,14 +80,14 @@ class DataLauncher:
         ttk.Entry(row1, textvariable=self.trash_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         ttk.Button(row1, text="浏览...", width=7, command=self.browse_trash).pack(side=tk.RIGHT)
 
-        # Tub 输出目录（强制命名，只读显示）
+        # Tub 输出目录（可编辑下拉框，自动扫描现有 tub* 目录）
         row2 = ttk.Frame(dir_frame)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Tub 输出目录:", width=14).pack(side=tk.LEFT)
         self.output_var = tk.StringVar(value=self._compute_tub_path(self.input_var.get()))
-        self.output_entry = ttk.Entry(row2, textvariable=self.output_var, state='readonly')
-        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Label(row2, text="(自动)", foreground="gray").pack(side=tk.RIGHT)
+        self.output_combo = ttk.Combobox(row2, textvariable=self.output_var)
+        self.output_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Label(row2, text="(可选)", foreground="gray").pack(side=tk.RIGHT)
 
         # 数据集目录变更时自动更新 tub 输出路径
         self.input_var.trace_add('write', lambda *_: self._auto_update_output())
@@ -253,6 +253,22 @@ class DataLauncher:
         project_dir = os.path.dirname(os.path.normpath(input_dir))
         return os.path.join(project_dir, "tub")
 
+    @staticmethod
+    def _find_tub_dirs(input_dir):
+        """扫描数据集父目录下的 tub* 目录列表"""
+        if not input_dir or not os.path.isdir(input_dir):
+            return []
+        parent = os.path.dirname(os.path.normpath(input_dir))
+        tub_dirs = []
+        try:
+            for name in os.listdir(parent):
+                full = os.path.join(parent, name)
+                if os.path.isdir(full) and name.startswith('tub'):
+                    tub_dirs.append(full)
+        except OSError:
+            pass
+        return sorted(tub_dirs)
+
     # ---- 日志 ----
     def log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
@@ -272,7 +288,20 @@ class DataLauncher:
 
     def _auto_update_output(self):
         """输入目录变更时自动计算并更新 tub 输出路径和各类计数"""
-        self.output_var.set(self._compute_tub_path(self.input_var.get()))
+        input_dir = self.input_var.get()
+        default_tub = self._compute_tub_path(input_dir)
+        existing = self._find_tub_dirs(input_dir)
+
+        # 将现有 tub* 目录设为下拉选项，默认值放在最前面
+        if default_tub and default_tub not in existing:
+            values = [default_tub] + existing
+        else:
+            values = existing
+            if default_tub not in values:
+                values.insert(0, default_tub)
+        self.output_combo['values'] = values
+        self.output_var.set(default_tub)
+
         self._refresh_counts()
         # 清除之前的建议说明
         self._bal_suggest_label.config(text="")
