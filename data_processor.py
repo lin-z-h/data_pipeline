@@ -55,6 +55,144 @@ DEFAULT_AUG_CONFIG = {
 }
 
 
+# 默认均衡配置
+DEFAULT_BALANCE_MODE = "downsample"  # downsample | upsample
+
+
+# ==========================================
+# 比例解析
+# ==========================================
+
+def _parse_ratio(ratio_str):
+    """解析比例字符串为 dict
+
+    格式: "FW:N,TL:N,TR:N" → {"FW": N, "TL": N, "TR": N}
+    容错: 支持空格、大小写不敏感、部分缺省（缺省值=1）
+
+    Args:
+        ratio_str: 如 "FW:2,TL:2,TR:1" 或 "fw:3,tr:1"
+
+    Returns:
+        dict 或 None（解析失败）
+    """
+    if not ratio_str or not isinstance(ratio_str, str):
+        return None
+
+    ratio = {}
+    try:
+        parts = [p.strip() for p in ratio_str.split(',')]
+        for part in parts:
+            if ':' not in part:
+                continue
+            cmd, val = part.split(':', 1)
+            cmd = cmd.strip().upper()
+            val = int(val.strip())
+            if cmd in ('FW', 'TL', 'TR') and val > 0:
+                ratio[cmd] = val
+    except (ValueError, AttributeError):
+        return None
+
+    # 至少需要一个有效类别
+    if not ratio:
+        return None
+
+    # 缺省填充：未指定的类别默认比例=1
+    for cmd in ('FW', 'TL', 'TR'):
+        if cmd not in ratio:
+            ratio[cmd] = 1
+
+    return ratio
+
+
+# ==========================================
+# 类别均衡
+# ==========================================
+
+def _balance_classes(image_paths, ratio, mode="downsample"):
+    """按指定比例均衡各类别帧数
+
+    Args:
+        image_paths: 已排序的图片路径列表
+        ratio:       dict，如 {"FW": 2, "TL": 2, "TR": 1}
+        mode:        "downsample" | "upsample"
+
+    Returns:
+        (selected_paths, class_multipliers)
+          - selected_paths:   均衡后的图片路径列表（已排序）
+          - class_multipliers: upsample 模式下各类增强倍率 dict，downsample 返回 None
+    """
+    # ---- 按指令分类 ----
+    buckets = {'FW': [], 'TL': [], 'TR': []}
+    for p in image_paths:
+        _, command = parse_filename(os.path.basename(p))
+        if command in buckets:
+            buckets[command].append(p)
+
+    counts = {c: len(buckets[c]) for c in buckets}
+    total = sum(counts.values())
+    if total == 0:
+        return image_paths, None
+
+    print(f"[均衡] 原始分布: FW={counts['FW']}, TL={counts['TL']}, TR={counts['TR']}")
+
+    # ---- 计算目标数量 ----
+    if mode == "downsample":
+        # 以最紧缺类别为基准，按比例收缩
+        ratios_list = [counts[c] / ratio.get(c, 1) for c in buckets if ratio.get(c, 1) > 0]
+        if not ratios_list:
+            return image_paths, None
+        base = min(ratios_list)
+    elif mode == "upsample":
+        # 以最充裕类别为基准，按比例扩张
+        ratios_list = [counts[c] / ratio.get(c, 1) for c in buckets if ratio.get(c, 1) > 0]
+        if not ratios_list:
+            return image_paths, None
+        base = max(ratios_list)
+    else:
+        print(f"[!] 未知均衡模式 '{mode}'，使用 downsample")
+        return _balance_classes(image_paths, ratio, "downsample")
+
+    targets = {}
+    for c in buckets:
+        targets[c] = max(1, int(base * ratio.get(c, 1)))
+
+    print(f"[均衡] 目标分布 (base={base:.1f}): FW={targets['FW']}, "
+          f"TL={targets['TL']}, TR={targets['TR']}")
+
+    # ---- 按模式执行 ----
+    if mode == "downsample":
+        selected = []
+        for c in buckets:
+            n = min(targets[c], counts[c])
+            if n < counts[c]:
+                selected.extend(random.sample(buckets[c], n))
+            else:
+                selected.extend(buckets[c])
+
+        selected.sort()
+        print(f"[均衡] downsample 完成: {len(selected)} 帧 "
+              f"(丢弃 {total - len(selected)} 帧)")
+        return selected, None
+
+    elif mode == "upsample":
+        # 全部保留，计算各类需要的增强倍率
+        multipliers = {}
+        for c in buckets:
+            if counts[c] > 0 and targets[c] > counts[c]:
+                # 需要每个原始帧平均生成多少额外变体
+                # 倍率 = 需要新增的数量 / 原数量
+                multipliers[c] = (targets[c] - counts[c]) / counts[c]
+            else:
+                multipliers[c] = 0.0
+
+        image_paths.sort()
+        print(f"[均衡] upsample 模式: 全部 {total} 帧保留，增强倍率 "
+              f"FW={multipliers['FW']:.2f}, "
+              f"TL={multipliers['TL']:.2f}, "
+              f"TR={multipliers['TR']:.2f}")
+        return image_paths, multipliers
+
+
 # ==========================================
 # 文件名解析
 # ==========================================
@@ -155,8 +293,10 @@ def _normalize_aug_config(augmentations):
 # Tub 生成主流程
 # ==========================================
 
-def create_tub(input_dir, output_dir=None, augmentations=None, replace_original=False):
-    """将原始图片文件夹标准化为 tub 格式数据集，可选数据增强
+def create_tub(input_dir, output_dir=None, augmentations=None,
+               replace_original=False,
+               balance_ratio=None, balance_mode=None):
+    """将原始图片文件夹标准化为 tub 格式数据集，可选数据增强和类别均衡
 
     Args:
         input_dir:        原始图片所在目录（经过 data_reviewer 清洗后）
@@ -167,6 +307,8 @@ def create_tub(input_dir, output_dir=None, augmentations=None, replace_original=
                           None 则使用 DEFAULT_AUG_CONFIG
         replace_original: True=增强图片替代原图（不保留原始帧），
                           False=原图始终保留，增强为额外记录
+        balance_ratio:    None 不启用均衡；或 dict 如 {"FW": 2, "TL": 2, "TR": 1}
+        balance_mode:     "downsample"（默认）或 "upsample"
 
     Returns:
         str: tub 输出目录路径，失败时返回 None
@@ -222,6 +364,20 @@ def create_tub(input_dir, output_dir=None, augmentations=None, replace_original=
     else:
         print(f"[*] 模式: 保留原图（增强为额外记录）")
 
+    # ---- 类别均衡 ----
+    class_multipliers = None
+    if balance_ratio is not None:
+        _mode = balance_mode or DEFAULT_BALANCE_MODE
+        print(f"[均衡] 目标比例 FW:{balance_ratio.get('FW',1)}:"
+              f"TL:{balance_ratio.get('TL',1)}:TR:{balance_ratio.get('TR',1)}, "
+              f"模式={_mode}")
+        balanced_paths, class_multipliers = _balance_classes(
+            image_paths, balance_ratio, _mode
+        )
+        if balanced_paths is not None:
+            image_paths = balanced_paths
+            total_files = len(image_paths)
+
     # ---- 逐帧处理 ----
     records = []
     record_count = 0
@@ -254,10 +410,19 @@ def create_tub(input_dir, output_dir=None, augmentations=None, replace_original=
         has_bc = False
         has_blur = False
 
+        # 计算有效增强概率（upsample 模式下不足类别放大）
+        _bc_prob = bc_cfg['probability']
+        _blur_prob = blur_cfg['probability']
+        if class_multipliers and command in class_multipliers:
+            mult = class_multipliers[command]
+            if mult > 0:
+                _bc_prob = min(bc_cfg['probability'] * (1 + mult), 1.0)
+                _blur_prob = min(blur_cfg['probability'] * (1 + mult), 1.0)
+
         # 独立判定两种增强是否触发
-        if bc_cfg['enabled'] and random.random() < bc_cfg['probability']:
+        if bc_cfg['enabled'] and random.random() < _bc_prob:
             has_bc = True
-        if blur_cfg['enabled'] and random.random() < blur_cfg['probability']:
+        if blur_cfg['enabled'] and random.random() < _blur_prob:
             has_blur = True
 
         if replace_original:
@@ -386,6 +551,8 @@ if __name__ == '__main__':
   python data_processor.py user/clockwise-v1/datas --bc-prob 0.3
   python data_processor.py user/clockwise-v1/datas --no-augment
   python data_processor.py user/clockwise-v1/datas --bc-prob 0.2 --blur-prob 0.15 --replace
+  python data_processor.py user/clockwise-v1/datas --ratio "FW:2,TL:2,TR:1"
+  python data_processor.py user/clockwise-v1/datas --ratio "FW:2,TL:2,TR:1" --balance-mode upsample
         """
     )
 
@@ -409,6 +576,13 @@ if __name__ == '__main__':
     parser.add_argument('--replace', action='store_true',
                         help='覆盖模式：增强替代原图，不保留原始帧')
 
+    # 类别均衡
+    parser.add_argument('--ratio', type=str, default=None,
+                        help='类别均衡比例，格式 "FW:N,TL:N,TR:N"（如 "FW:2,TL:2,TR:1"）')
+    parser.add_argument('--balance-mode', type=str, default=None,
+                        choices=['downsample', 'upsample'],
+                        help='均衡模式: downsample(降采样)或upsample(升采样)，默认 downsample')
+
     args = parser.parse_args()
 
     # 构建增强配置
@@ -429,6 +603,15 @@ if __name__ == '__main__':
         elif args.blur_prob is not None:
             aug_config['gaussian_blur'] = {'probability': args.blur_prob}
 
+    # 解析均衡比例
+    balance_ratio = None
+    if args.ratio is not None:
+        balance_ratio = _parse_ratio(args.ratio)
+        if balance_ratio is None:
+            print("[-] 无法解析 --ratio 参数，已禁用均衡功能")
+
     create_tub(args.input_dir, args.output,
                aug_config if aug_config else None,
-               replace_original=args.replace)
+               replace_original=args.replace,
+               balance_ratio=balance_ratio,
+               balance_mode=args.balance_mode or DEFAULT_BALANCE_MODE)

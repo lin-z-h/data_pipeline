@@ -48,7 +48,7 @@ class DataLauncher:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("AutoCar 数据处理面板")
-        self.root.geometry("700x500")
+        self.root.geometry("700x550")
         self.root.minsize(580, 400)
         self.root.resizable(True, True)
 
@@ -126,6 +126,69 @@ class DataLauncher:
         self.replace_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(aug_frame, text="覆盖原图（不保留原始帧）",
                         variable=self.replace_var).pack(anchor=tk.W, pady=2)
+
+        # 数据均衡
+        bal_frame = ttk.LabelFrame(action_frame, text="数据均衡", padding=6)
+        bal_frame.pack(side=tk.LEFT, padx=8)
+
+        # 启用开关
+        self.balance_enabled_var = tk.BooleanVar(value=False)
+        self.balance_mode_var = tk.StringVar(value='downsample')
+
+        bal_top = ttk.Frame(bal_frame)
+        bal_top.pack(anchor=tk.W, pady=1)
+        ttk.Checkbutton(bal_top, text="启用类别均衡",
+                        variable=self.balance_enabled_var,
+                        command=self._toggle_balance).pack(side=tk.LEFT)
+
+        # 各类张数显示
+        self.bal_count_var = tk.StringVar(value="(未扫描)")
+        count_row = ttk.Frame(bal_frame)
+        count_row.pack(anchor=tk.W, pady=1)
+        ttk.Label(count_row, text="当前:", foreground="gray").pack(side=tk.LEFT)
+        ttk.Label(count_row, textvariable=self.bal_count_var,
+                  foreground="gray").pack(side=tk.LEFT)
+
+        # 建议比例按钮
+        suggest_row = ttk.Frame(bal_frame)
+        suggest_row.pack(anchor=tk.W, pady=1)
+        self._bal_suggest_btn = ttk.Button(
+            suggest_row, text="建议比例", width=9,
+            command=self._suggest_ratio, state=tk.DISABLED)
+        self._bal_suggest_btn.pack(side=tk.LEFT)
+        self._bal_suggest_label = ttk.Label(
+            suggest_row, text="", foreground="gray")
+        self._bal_suggest_label.pack(side=tk.LEFT, padx=4)
+
+        # 比例设置
+        self.balance_fw_var = tk.IntVar(value=2)
+        self.balance_tl_var = tk.IntVar(value=2)
+        self.balance_tr_var = tk.IntVar(value=1)
+
+        ratio_row = ttk.Frame(bal_frame)
+        ratio_row.pack(anchor=tk.W, pady=1)
+        self._bal_ratio_widgets = []  # 用于状态切换
+        for label, var in [("FW", self.balance_fw_var),
+                           ("TL", self.balance_tl_var),
+                           ("TR", self.balance_tr_var)]:
+            ttk.Label(ratio_row, text=f" {label}").pack(side=tk.LEFT)
+            sb = ttk.Spinbox(ratio_row, from_=1, to=10, width=3,
+                             textvariable=var, state=tk.DISABLED)
+            sb.pack(side=tk.LEFT)
+            self._bal_ratio_widgets.append(sb)
+
+        # 模式选择
+        mode_row = ttk.Frame(bal_frame)
+        mode_row.pack(anchor=tk.W, pady=1)
+        self._bal_radio_ds = ttk.Radiobutton(
+            mode_row, text="降采样", value="downsample",
+            variable=self.balance_mode_var, state=tk.DISABLED)
+        self._bal_radio_ds.pack(side=tk.LEFT)
+        self._bal_radio_us = ttk.Radiobutton(
+            mode_row, text="升采样", value="upsample",
+            variable=self.balance_mode_var, state=tk.DISABLED)
+        self._bal_radio_us.pack(side=tk.LEFT)
+        self._bal_mode_widgets = [self._bal_radio_ds, self._bal_radio_us]
 
         # 操作按钮
         btn_frame = ttk.Frame(action_frame)
@@ -208,8 +271,96 @@ class DataLauncher:
             self.trash_var.set(os.path.normpath(path))
 
     def _auto_update_output(self):
-        """输入目录变更时自动计算并更新 tub 输出路径"""
+        """输入目录变更时自动计算并更新 tub 输出路径和各类计数"""
         self.output_var.set(self._compute_tub_path(self.input_var.get()))
+        self._refresh_counts()
+        # 清除之前的建议说明
+        self._bal_suggest_label.config(text="")
+
+    def _toggle_balance(self):
+        """启用/禁用均衡控件的可编辑状态"""
+        enabled = self.balance_enabled_var.get()
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for w in self._bal_ratio_widgets:
+            w.config(state=state)
+        for w in self._bal_mode_widgets:
+            w.config(state=state)
+        self._bal_suggest_btn.config(state=state)
+        if enabled:
+            self._refresh_counts()
+
+    def _count_classes(self, input_dir):
+        """统计目录中各类别图片数量
+
+        Returns:
+            dict {"FW": n, "TL": n, "TR": n} 或 None（目录无效）
+        """
+        if not input_dir or not os.path.isdir(input_dir):
+            return None
+        counts = {"FW": 0, "TL": 0, "TR": 0}
+        for f in _glob.glob(os.path.join(input_dir, '*.jpg')):
+            name = os.path.basename(f)
+            parts = name.split('_')
+            if len(parts) >= 3:
+                cmd = parts[-1].split('.')[0]
+                if cmd in counts:
+                    counts[cmd] += 1
+        return counts
+
+    def _refresh_counts(self):
+        """更新均衡面板中的各类张数显示"""
+        input_dir = self.input_var.get().strip()
+        counts = self._count_classes(input_dir)
+        if counts:
+            self.bal_count_var.set(
+                f"FW={counts['FW']}, TL={counts['TL']}, TR={counts['TR']}")
+        else:
+            self.bal_count_var.set("(目录无效)")
+
+    def _suggest_ratio(self):
+        """根据实际数据分布，自动建议均衡比例
+
+        算法: 以最少类别为基准(ratio=1)，其他类别按比例计算，上限3
+              确保最少类别的数据被完全保留
+        """
+        input_dir = self.input_var.get().strip()
+        counts = self._count_classes(input_dir)
+        if not counts:
+            messagebox.showwarning("警告", "无法扫描目录，请先选择有效的数据集目录。")
+            return
+
+        total = sum(counts.values())
+        if total == 0:
+            return
+
+        # 找出最少的类别
+        min_cmd = min(counts, key=counts.get)
+        min_count = counts[min_cmd]
+
+        if min_count == 0:
+            messagebox.showwarning("警告", f"类别 {min_cmd} 数量为0，无法计算比例。")
+            return
+
+        # 计算建议比例，上限 3
+        MAX_RATIO = 3
+        ratios = {}
+        for cmd in ("FW", "TL", "TR"):
+            if counts[cmd] == 0:
+                ratios[cmd] = 1
+            else:
+                raw = counts[cmd] / min_count
+                ratios[cmd] = max(1, min(int(raw + 0.5), MAX_RATIO))
+
+        # 填入 GUI
+        self.balance_fw_var.set(ratios["FW"])
+        self.balance_tl_var.set(ratios["TL"])
+        self.balance_tr_var.set(ratios["TR"])
+
+        # 显示建议说明
+        self._bal_suggest_label.config(
+            text=f"(最少: {min_cmd}={min_count}, "
+                 f"上限={MAX_RATIO}×)" if ratios[max(ratios, key=ratios.get)] == MAX_RATIO
+                 else f"(基准: {min_cmd}={min_count})")
 
     # ---- 审核清洗 ----
     def on_review(self):
@@ -283,14 +434,32 @@ class DataLauncher:
         }
         replace_original = self.replace_var.get()
 
+        # 构建均衡参数
+        balance_ratio = None
+        balance_mode = 'downsample'
+        if self.balance_enabled_var.get():
+            balance_ratio = {
+                'FW': self.balance_fw_var.get(),
+                'TL': self.balance_tl_var.get(),
+                'TR': self.balance_tr_var.get(),
+            }
+            balance_mode = self.balance_mode_var.get()
+
         bc_cfg = aug_config['brightness_contrast']
         blur_cfg = aug_config['gaussian_blur']
-        self.log(f"[处理] 启动 → 增强: "
-                 f"高斯模糊={'ON' if blur_cfg['enabled'] else 'OFF'}"
-                 f"({blur_cfg['probability']:.0%}), "
-                 f"亮度对比度={'ON' if bc_cfg['enabled'] else 'OFF'}"
-                 f"({bc_cfg['probability']:.0%}), "
-                 f"覆盖={'ON' if replace_original else 'OFF'}")
+        log_parts = [
+            f"增强: 高斯模糊={'ON' if blur_cfg['enabled'] else 'OFF'}"
+            f"({blur_cfg['probability']:.0%})",
+            f"亮度对比度={'ON' if bc_cfg['enabled'] else 'OFF'}"
+            f"({bc_cfg['probability']:.0%})",
+            f"覆盖={'ON' if replace_original else 'OFF'}",
+        ]
+        if balance_ratio:
+            log_parts.append(
+                f"均衡: {balance_mode} FW:{balance_ratio['FW']}"
+                f":TL:{balance_ratio['TL']}:TR:{balance_ratio['TR']}"
+            )
+        self.log(f"[处理] 启动 → " + ", ".join(log_parts))
 
         # 禁用按钮
         self.btn_review.config(state=tk.DISABLED)
@@ -301,7 +470,9 @@ class DataLauncher:
             sys.stdout = LogRedirector(self.root, self.log)
             try:
                 create_tub(input_dir, output_dir, aug_config,
-                           replace_original=replace_original)
+                           replace_original=replace_original,
+                           balance_ratio=balance_ratio,
+                           balance_mode=balance_mode)
             except Exception as e:
                 self.root.after(0, self.log, f"[-] 错误: {e}")
             finally:
